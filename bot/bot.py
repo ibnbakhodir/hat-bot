@@ -1,5 +1,7 @@
 import os
 import logging
+import threading
+from http.server import HTTPServer, BaseHTTPRequestHandler
 from pathlib import Path
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import Application, CommandHandler, MessageHandler, ContextTypes, filters
@@ -12,6 +14,7 @@ logger = logging.getLogger(__name__)
 
 TOKEN = os.environ["TELEGRAM_BOT_TOKEN"]
 ADMIN_GROUP_ID = int(os.environ.get("ADMIN_GROUP_ID", "0"))
+PORT = int(os.environ.get("PORT", "8080"))
 
 ASSETS_DIR = Path(__file__).parent / "assets"
 BANNER_IMAGE = ASSETS_DIR / "banner.jpg"
@@ -33,12 +36,31 @@ WELCOME_CAPTION = (
 )
 
 
+# ── Health check server (keeps Render web service alive) ─────────────────────
+
+class HealthHandler(BaseHTTPRequestHandler):
+    def do_GET(self):
+        self.send_response(200)
+        self.end_headers()
+        self.wfile.write(b"OK")
+
+    def log_message(self, format, *args):
+        pass  # suppress access logs
+
+
+def run_health_server():
+    server = HTTPServer(("0.0.0.0", PORT), HealthHandler)
+    logger.info(f"Health server running on port {PORT}")
+    server.serve_forever()
+
+
+# ── Bot handlers ──────────────────────────────────────────────────────────────
+
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     keyboard = InlineKeyboardMarkup([
         [InlineKeyboardButton("📢 Join Our Channel", url="https://t.me/Hireatrucker")],
         [InlineKeyboardButton("📞 Contact Support", callback_data="support")],
     ])
-
     if BANNER_IMAGE.exists():
         with open(BANNER_IMAGE, "rb") as photo:
             await update.message.reply_photo(
@@ -66,13 +88,13 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
 
 
 async def chatid_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    chat = update.effective_chat
-    await update.message.reply_text(f"Chat ID: `{chat.id}`", parse_mode="Markdown")
+    await update.message.reply_text(
+        f"Chat ID: `{update.effective_chat.id}`", parse_mode="Markdown"
+    )
 
 
 async def handle_user_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not ADMIN_GROUP_ID:
-        logger.warning("ADMIN_GROUP_ID is not set — cannot forward messages.")
         await update.message.reply_text(
             "⚠️ Our support system is temporarily unavailable. Please try again later."
         )
@@ -80,7 +102,6 @@ async def handle_user_message(update: Update, context: ContextTypes.DEFAULT_TYPE
 
     user = update.effective_user
     msg = update.message
-
     username_line = f"@{user.username}\n" if user.username else ""
     header = (
         f"👤 *User:* [{user.full_name}](tg://user?id={user.id})\n"
@@ -89,7 +110,6 @@ async def handle_user_message(update: Update, context: ContextTypes.DEFAULT_TYPE
     )
 
     forwarded = None
-
     if msg.text:
         forwarded = await context.bot.send_message(
             chat_id=ADMIN_GROUP_ID,
@@ -135,7 +155,6 @@ async def handle_user_message(update: Update, context: ContextTypes.DEFAULT_TYPE
             sticker=msg.sticker.file_id,
         )
     else:
-        logger.info(f"Unsupported message type from user {user.id}")
         return
 
     if forwarded:
@@ -148,20 +167,12 @@ async def handle_user_message(update: Update, context: ContextTypes.DEFAULT_TYPE
 
 async def handle_admin_reply(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     msg = update.message
-
-    if msg.chat.id != ADMIN_GROUP_ID:
-        return
-    if not msg.reply_to_message:
+    if msg.chat.id != ADMIN_GROUP_ID or not msg.reply_to_message:
         return
 
-    replied_id = msg.reply_to_message.message_id
-    user_id = context.bot_data.get(replied_id)
-
+    user_id = context.bot_data.get(msg.reply_to_message.message_id)
     if not user_id:
         return
-
-    admin = update.effective_user
-    logger.info(f"Admin '{admin.full_name}' replied to user {user_id}")
 
     if msg.text:
         await context.bot.send_message(
@@ -196,18 +207,21 @@ async def handle_admin_reply(update: Update, context: ContextTypes.DEFAULT_TYPE)
         await context.bot.send_sticker(chat_id=user_id, sticker=msg.sticker.file_id)
 
 
-def main() -> None:
-    app = Application.builder().token(TOKEN).build()
+# ── Main ──────────────────────────────────────────────────────────────────────
 
+def main() -> None:
+    # Start health check server in background thread
+    t = threading.Thread(target=run_health_server, daemon=True)
+    t.start()
+
+    app = Application.builder().token(TOKEN).build()
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("help", help_command))
     app.add_handler(CommandHandler("chatid", chatid_command))
-
     app.add_handler(MessageHandler(
         filters.ChatType.PRIVATE & ~filters.COMMAND,
         handle_user_message,
     ))
-
     if ADMIN_GROUP_ID:
         app.add_handler(MessageHandler(
             filters.Chat(ADMIN_GROUP_ID) & filters.REPLY & ~filters.COMMAND,

@@ -1,8 +1,14 @@
 import os
+import sys
 import logging
 import threading
 from http.server import HTTPServer, BaseHTTPRequestHandler
 from pathlib import Path
+
+# If DISABLE_BOT is set, exit immediately (prevents conflict when Render is running)
+if os.environ.get("DISABLE_BOT"):
+    print("Bot disabled on this environment (DISABLE_BOT is set). Running on Render instead.")
+    sys.exit(0)
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import Application, CommandHandler, MessageHandler, ContextTypes, filters
 

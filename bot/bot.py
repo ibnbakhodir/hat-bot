@@ -1,242 +1,458 @@
+"""
+HAT Support Bot — Hire A Trucker Telegram Support Bot
+
+Foydalanuvchilar bilan admin guruhi o'rtasida xabar almashish uchun
+support bot. Polling rejimida ishlaydi.
+"""
+
 import os
-import sys
 import logging
 import threading
 from http.server import HTTPServer, BaseHTTPRequestHandler
 from pathlib import Path
 
-# If DISABLE_BOT is set, exit immediately (prevents conflict when Render is running)
-if os.environ.get("DISABLE_BOT"):
-    print("Bot disabled on this environment (DISABLE_BOT is set). Running on Render instead.")
-    sys.exit(0)
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
-from telegram.ext import Application, CommandHandler, MessageHandler, ContextTypes, filters
+from telegram import (
+    Update,
+    InlineKeyboardButton,
+    InlineKeyboardMarkup,
+    InputMediaPhoto,
+    InputMediaVideo,
+    InputMediaDocument,
+)
+from telegram.ext import (
+    Application,
+    CommandHandler,
+    MessageHandler,
+    CallbackQueryHandler,
+    ContextTypes,
+    filters,
+)
 
+# ── Logging ─────────────────────────────────────────────────────────
 logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
     level=logging.INFO,
 )
 logger = logging.getLogger(__name__)
 
-TOKEN = os.environ["TELEGRAM_BOT_TOKEN"]
+# ── Environment variables ───────────────────────────────────────────
+BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "")
 ADMIN_GROUP_ID = int(os.environ.get("ADMIN_GROUP_ID", "0"))
 PORT = int(os.environ.get("PORT", "8080"))
 
-ASSETS_DIR = Path(__file__).parent / "assets"
-BANNER_IMAGE = ASSETS_DIR / "banner.jpg"
+# ── Assets ──────────────────────────────────────────────────────────
+BANNER_PATH = Path(__file__).parent / "assets" / "banner.jpg"
 
-WELCOME_CAPTION = (
+START_CAPTION = (
     "🚛 *Welcome to HAT — Hire A Trucker*\n"
-    "_Driver Marketplace · Connecting Truckers & Carriers in US Logistics · No Middleman Fees_\n\n"
+    "Driver Marketplace · Connecting Truckers & Carriers in US Logistics\n"
+    "\n"
     "━━━━━━━━━━━━━━━━━━━━\n"
     "📦 *For Carriers*\n"
-    "Browse your preferred driver from the driver board. "
-    "Post your job offers, dedicated lanes and get matched with verified, experienced drivers quickly and efficiently.\n\n"
+    "Browse your preferred driver from the driver board\\. "
+    "Post your job offers, dedicated lanes and get matched with "
+    "verified, experienced drivers quickly and efficiently\\.\n"
+    "\n"
     "🧑‍✈️ *For Drivers*\n"
-    "Just sign up and be listed on the available drivers board that carriers search. "
-    "Browse hundreds of real, up-to-date job offers — see how much carriers pay, home time, equipment type, bonuses, and more *before* you apply. "
-    "No more cold calling for outdated positions.\n\n"
+    "Just sign up and be listed on the available drivers board "
+    "that carriers search\\. Browse hundreds of real, up\\-to\\-date "
+    "job offers — see how much carriers pay, home time, equipment "
+    "type, bonuses, and more before you apply\\. No more cold calling "
+    "for outdated positions\\.\n"
+    "\n"
     "━━━━━━━━━━━━━━━━━━━━\n"
-    "💬 *Need support?* Send us a message — our team is here to help.\n"
-    "📢 *Stay updated* — follow our official channel for the latest news and offers."
+    "💬 Need support? Send us a message — our team is here to help\\.\n"
+    "📢 Stay updated — follow our official channel for the latest "
+    "news and offers\\."
 )
 
 
-# ── Health check server (keeps Render web service alive) ─────────────────────
-
+# ════════════════════════════════════════════════════════════════════
+#  Health‑check HTTP server  (threading)
+# ════════════════════════════════════════════════════════════════════
 class HealthHandler(BaseHTTPRequestHandler):
+    """Minimal handler — returns 200 OK on any GET."""
+
     def do_GET(self):
         self.send_response(200)
+        self.send_header("Content-Type", "text/plain")
         self.end_headers()
         self.wfile.write(b"OK")
 
-    def log_message(self, format, *args):
-        pass  # suppress access logs
+    # Suppress default stderr request logging
+    def log_message(self, format, *args):  # noqa: A002
+        pass
 
 
-def run_health_server():
+def start_health_server():
+    """Start a lightweight HTTP health server in a daemon thread."""
     server = HTTPServer(("0.0.0.0", PORT), HealthHandler)
-    logger.info(f"Health server running on port {PORT}")
-    server.serve_forever()
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    logger.info("Health server listening on port %s", PORT)
 
 
-# ── Bot handlers ──────────────────────────────────────────────────────────────
+# ════════════════════════════════════════════════════════════════════
+#  Helper — user info header for admin group
+# ════════════════════════════════════════════════════════════════════
+def _user_header(user) -> str:
+    """Build a human‑readable header with tg deep‑link."""
+    full_name = user.full_name or "No Name"
+    username = f"@{user.username}" if user.username else "N/A"
+    return (
+        f"👤 <a href='tg://user?id={user.id}'>{full_name}</a>\n"
+        f"🆔 ID: <code>{user.id}</code>\n"
+        f"📎 Username: {username}\n"
+        f"{'─' * 30}"
+    )
 
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    keyboard = InlineKeyboardMarkup([
-        [InlineKeyboardButton("📢 Join Our Channel", url="https://t.me/Hireatrucker")],
-        [InlineKeyboardButton("📞 Contact Support", callback_data="support")],
-    ])
-    if BANNER_IMAGE.exists():
-        with open(BANNER_IMAGE, "rb") as photo:
+
+# ════════════════════════════════════════════════════════════════════
+#  Command Handlers
+# ════════════════════════════════════════════════════════════════════
+async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """/start — Send banner image with inline buttons."""
+    keyboard = InlineKeyboardMarkup(
+        [
+            [
+                InlineKeyboardButton(
+                    "📢 Join Our Channel", url="https://t.me/Hireatrucker"
+                ),
+                InlineKeyboardButton(
+                    "📞 Contact Support", callback_data="contact_support"
+                ),
+            ]
+        ]
+    )
+
+    if BANNER_PATH.exists():
+        with open(BANNER_PATH, "rb") as photo:
             await update.message.reply_photo(
                 photo=photo,
-                caption=WELCOME_CAPTION,
-                parse_mode="Markdown",
+                caption=START_CAPTION,
+                parse_mode="MarkdownV2",
                 reply_markup=keyboard,
             )
     else:
+        # Fallback if banner file is missing
         await update.message.reply_text(
-            WELCOME_CAPTION,
-            parse_mode="Markdown",
+            START_CAPTION,
+            parse_mode="MarkdownV2",
             reply_markup=keyboard,
         )
 
 
-async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    await update.message.reply_text(
-        "📋 *Available Commands*\n\n"
-        "/start — Welcome message & platform overview\n"
-        "/help — Show this help menu\n\n"
-        "You can also send us any message and our support team will get back to you shortly.",
-        parse_mode="Markdown",
+async def contact_support_callback(
+    update: Update, context: ContextTypes.DEFAULT_TYPE
+):
+    """Handle "Contact Support" inline button press."""
+    query = update.callback_query
+    await query.answer()
+    await query.message.reply_text(
+        "✍️ Iltimos, xabaringizni yozing — support jamoamiz tez orada javob beradi!"
     )
 
 
-async def chatid_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    await update.message.reply_text(
-        f"Chat ID: `{update.effective_chat.id}`", parse_mode="Markdown"
+async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """/help — List available commands."""
+    text = (
+        "📋 *Mavjud buyruqlar:*\n\n"
+        "/start — Botni ishga tushirish va ma'lumot olish\n"
+        "/help — Ushbu yordam xabarini ko'rish\n"
+        "/chatid — Joriy chat ID ni bilish \\(admin uchun\\)\n\n"
+        "✍️ Oddiy xabar yuboring — support jamoamiz javob beradi\\!"
     )
+    await update.message.reply_text(text, parse_mode="MarkdownV2")
 
 
-async def handle_user_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if not ADMIN_GROUP_ID:
-        await update.message.reply_text(
-            "⚠️ Our support system is temporarily unavailable. Please try again later."
-        )
+async def chatid_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """/chatid — Show the current chat ID (useful for admins)."""
+    chat_id = update.effective_chat.id
+    await update.message.reply_text(f"🆔 Bu chatning ID si: <code>{chat_id}</code>", parse_mode="HTML")
+
+
+# ════════════════════════════════════════════════════════════════════
+#  User → Admin Group  (forwarding messages)
+# ════════════════════════════════════════════════════════════════════
+async def handle_user_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Forward any user message to admin group with user info header."""
+    message = update.message
+    user = message.from_user
+    chat_id = message.chat_id
+
+    # Only process private chats
+    if message.chat.type != "private":
         return
 
-    user = update.effective_user
-    msg = update.message
-    username_line = f"@{user.username}\n" if user.username else ""
-    header = (
-        f"👤 *User:* [{user.full_name}](tg://user?id={user.id})\n"
-        f"🆔 ID: `{user.id}`\n"
-        f"{username_line}"
+    if not ADMIN_GROUP_ID:
+        await message.reply_text("⚠️ Support hozircha mavjud emas. Keyinroq urinib ko'ring.")
+        return
+
+    header = _user_header(user)
+
+    # Send header first
+    header_msg = await context.bot.send_message(
+        chat_id=ADMIN_GROUP_ID,
+        text=header,
+        parse_mode="HTML",
     )
 
-    forwarded = None
-    if msg.text:
-        forwarded = await context.bot.send_message(
+    # Forward the actual content based on message type
+    forwarded_msg = None
+
+    if message.text:
+        forwarded_msg = await context.bot.send_message(
             chat_id=ADMIN_GROUP_ID,
-            text=f"{header}\n💬 {msg.text}",
-            parse_mode="Markdown",
+            text=f"💬 {message.text}",
+            reply_to_message_id=header_msg.message_id,
         )
-    elif msg.photo:
-        forwarded = await context.bot.send_photo(
+    elif message.photo:
+        forwarded_msg = await context.bot.send_photo(
             chat_id=ADMIN_GROUP_ID,
-            photo=msg.photo[-1].file_id,
-            caption=f"{header}\n📷 Photo" + (f"\n{msg.caption}" if msg.caption else ""),
-            parse_mode="Markdown",
+            photo=message.photo[-1].file_id,
+            caption=message.caption or "",
+            reply_to_message_id=header_msg.message_id,
         )
-    elif msg.video:
-        forwarded = await context.bot.send_video(
+    elif message.video:
+        forwarded_msg = await context.bot.send_video(
             chat_id=ADMIN_GROUP_ID,
-            video=msg.video.file_id,
-            caption=f"{header}\n🎥 Video" + (f"\n{msg.caption}" if msg.caption else ""),
-            parse_mode="Markdown",
+            video=message.video.file_id,
+            caption=message.caption or "",
+            reply_to_message_id=header_msg.message_id,
         )
-    elif msg.document:
-        forwarded = await context.bot.send_document(
+    elif message.document:
+        forwarded_msg = await context.bot.send_document(
             chat_id=ADMIN_GROUP_ID,
-            document=msg.document.file_id,
-            caption=f"{header}\n📎 File" + (f"\n{msg.caption}" if msg.caption else ""),
-            parse_mode="Markdown",
+            document=message.document.file_id,
+            caption=message.caption or "",
+            reply_to_message_id=header_msg.message_id,
         )
-    elif msg.voice:
-        forwarded = await context.bot.send_voice(
+    elif message.voice:
+        forwarded_msg = await context.bot.send_voice(
             chat_id=ADMIN_GROUP_ID,
-            voice=msg.voice.file_id,
-            caption=f"{header}\n🎤 Voice message",
-            parse_mode="Markdown",
+            voice=message.voice.file_id,
+            caption=message.caption or "",
+            reply_to_message_id=header_msg.message_id,
         )
-    elif msg.sticker:
-        await context.bot.send_message(
+    elif message.sticker:
+        forwarded_msg = await context.bot.send_sticker(
             chat_id=ADMIN_GROUP_ID,
-            text=f"{header}\n🎯 Sent a sticker",
-            parse_mode="Markdown",
-        )
-        forwarded = await context.bot.send_sticker(
-            chat_id=ADMIN_GROUP_ID,
-            sticker=msg.sticker.file_id,
+            sticker=message.sticker.file_id,
+            reply_to_message_id=header_msg.message_id,
         )
     else:
-        return
+        forwarded_msg = await context.bot.send_message(
+            chat_id=ADMIN_GROUP_ID,
+            text="⚠️ Noma'lum xabar turi",
+            reply_to_message_id=header_msg.message_id,
+        )
 
-    if forwarded:
-        context.bot_data[forwarded.message_id] = user.id
+    # Save mapping: admin group message ID → user chat ID
+    if forwarded_msg:
+        context.bot_data[header_msg.message_id] = chat_id
+        context.bot_data[forwarded_msg.message_id] = chat_id
 
-    await msg.reply_text(
-        "✅ Your message has been received. Our support team will get back to you shortly."
+    # Confirm to the user
+    await message.reply_text(
+        "✅ Xabaringiz qabul qilindi! Support jamoamiz tez orada javob beradi."
+    )
+
+    logger.info(
+        "Message from %s (ID: %s) forwarded to admin group.",
+        user.full_name,
+        user.id,
     )
 
 
-async def handle_admin_reply(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    msg = update.message
-    if msg.chat.id != ADMIN_GROUP_ID or not msg.reply_to_message:
+# ════════════════════════════════════════════════════════════════════
+#  Admin Group → User  (reply‑based)
+# ════════════════════════════════════════════════════════════════════
+async def handle_admin_reply(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """When admin replies to a forwarded message, send response back to user."""
+    message = update.message
+
+    # Only process messages from the admin group
+    if message.chat_id != ADMIN_GROUP_ID:
         return
 
-    user_id = context.bot_data.get(msg.reply_to_message.message_id)
-    if not user_id:
+    # Must be a reply to a forwarded message
+    if not message.reply_to_message:
         return
 
-    if msg.text:
-        await context.bot.send_message(
-            chat_id=user_id,
-            text=f"📩 *Support Team:*\n\n{msg.text}",
-            parse_mode="Markdown",
+    reply_to_id = message.reply_to_message.message_id
+
+    # Look up the original user's chat ID
+    user_chat_id = context.bot_data.get(reply_to_id)
+    if not user_chat_id:
+        return
+
+    # Send admin's response to the user
+    try:
+        if message.text:
+            await context.bot.send_message(
+                chat_id=user_chat_id,
+                text=f"📩 *Support Team:*\n\n{message.text}",
+                parse_mode="Markdown",
+            )
+        elif message.photo:
+            await context.bot.send_photo(
+                chat_id=user_chat_id,
+                photo=message.photo[-1].file_id,
+                caption=f"📩 Support Team:\n\n{message.caption or ''}",
+            )
+        elif message.video:
+            await context.bot.send_video(
+                chat_id=user_chat_id,
+                video=message.video.file_id,
+                caption=f"📩 Support Team:\n\n{message.caption or ''}",
+            )
+        elif message.document:
+            await context.bot.send_document(
+                chat_id=user_chat_id,
+                document=message.document.file_id,
+                caption=f"📩 Support Team:\n\n{message.caption or ''}",
+            )
+        elif message.voice:
+            await context.bot.send_voice(
+                chat_id=user_chat_id,
+                voice=message.voice.file_id,
+                caption="📩 Support Team:",
+            )
+        elif message.sticker:
+            await context.bot.send_message(
+                chat_id=user_chat_id,
+                text="📩 *Support Team:*",
+                parse_mode="Markdown",
+            )
+            await context.bot.send_sticker(
+                chat_id=user_chat_id,
+                sticker=message.sticker.file_id,
+            )
+        else:
+            await context.bot.send_message(
+                chat_id=user_chat_id,
+                text="📩 *Support Team:*\n\nJavob yuborildi\\.",
+                parse_mode="Markdown",
+            )
+
+        # Also map this new reply for threading
+        context.bot_data[message.message_id] = user_chat_id
+
+        logger.info(
+            "Admin reply sent to user chat_id=%s",
+            user_chat_id,
         )
-    elif msg.photo:
-        await context.bot.send_photo(
-            chat_id=user_id,
-            photo=msg.photo[-1].file_id,
-            caption="📩 *Support Team:*" + (f"\n{msg.caption}" if msg.caption else ""),
-            parse_mode="Markdown",
+    except Exception as e:
+        logger.error("Failed to send reply to user %s: %s", user_chat_id, e)
+        await message.reply_text(
+            f"⚠️ Foydalanuvchiga xabar yuborib bo'lmadi: {e}"
         )
-    elif msg.video:
-        await context.bot.send_video(
-            chat_id=user_id,
-            video=msg.video.file_id,
-            caption="📩 *Support Team:*" + (f"\n{msg.caption}" if msg.caption else ""),
-            parse_mode="Markdown",
-        )
-    elif msg.document:
-        await context.bot.send_document(
-            chat_id=user_id,
-            document=msg.document.file_id,
-            caption="📩 *Support Team:*" + (f"\n{msg.caption}" if msg.caption else ""),
-            parse_mode="Markdown",
-        )
-    elif msg.voice:
-        await context.bot.send_voice(chat_id=user_id, voice=msg.voice.file_id)
-    elif msg.sticker:
-        await context.bot.send_sticker(chat_id=user_id, sticker=msg.sticker.file_id)
 
 
-# ── Main ──────────────────────────────────────────────────────────────────────
+# ════════════════════════════════════════════════════════════════════
+#  Error handler
+# ════════════════════════════════════════════════════════════════════
+async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE):
+    """Handle errors — suppress Conflict errors, log others."""
+    from telegram.error import Conflict
 
-def main() -> None:
-    # Start health check server in background thread
-    t = threading.Thread(target=run_health_server, daemon=True)
-    t.start()
+    if isinstance(context.error, Conflict):
+        # Conflict means another instance is running; just log once and skip
+        logger.debug("Conflict error (another instance running): %s", context.error)
+        return
 
-    app = Application.builder().token(TOKEN).build()
-    app.add_handler(CommandHandler("start", start))
+    logger.error("Unhandled exception: %s", context.error, exc_info=context.error)
+
+
+# ════════════════════════════════════════════════════════════════════
+#  Pre‑start cleanup — close any existing sessions
+# ════════════════════════════════════════════════════════════════════
+def _close_existing_sessions():
+    """Call /close and /deleteWebhook before starting polling."""
+    import urllib.request
+    import json as _json
+    import time as _time
+
+    base = f"https://api.telegram.org/bot{BOT_TOKEN}"
+
+    for endpoint in ("deleteWebhook?drop_pending_updates=true", "close"):
+        try:
+            resp = urllib.request.urlopen(f"{base}/{endpoint}", timeout=10)
+            data = _json.loads(resp.read())
+            logger.info("Pre-start %s: %s", endpoint.split("?")[0], data)
+        except Exception as e:
+            logger.warning("Pre-start %s failed: %s", endpoint.split("?")[0], e)
+
+    logger.info("Waiting 5 seconds for Telegram to release session...")
+    _time.sleep(5)
+
+
+# ════════════════════════════════════════════════════════════════════
+#  Main
+# ════════════════════════════════════════════════════════════════════
+def main():
+    """Initialize and run the bot."""
+    if not BOT_TOKEN:
+        logger.error("TELEGRAM_BOT_TOKEN environment variable is not set!")
+        return
+
+    if not ADMIN_GROUP_ID:
+        logger.warning(
+            "ADMIN_GROUP_ID is not set. Admin forwarding will be disabled."
+        )
+
+    # Start health server
+    start_health_server()
+
+    # Close any existing sessions first
+    _close_existing_sessions()
+
+    # Build the application
+    app = Application.builder().token(BOT_TOKEN).build()
+
+    # Error handler
+    app.add_error_handler(error_handler)
+
+    # Command handlers
+    app.add_handler(CommandHandler("start", start_command))
     app.add_handler(CommandHandler("help", help_command))
     app.add_handler(CommandHandler("chatid", chatid_command))
-    app.add_handler(MessageHandler(
-        filters.ChatType.PRIVATE & ~filters.COMMAND,
-        handle_user_message,
-    ))
-    if ADMIN_GROUP_ID:
-        app.add_handler(MessageHandler(
-            filters.Chat(ADMIN_GROUP_ID) & filters.REPLY & ~filters.COMMAND,
-            handle_admin_reply,
-        ))
 
-    logger.info(f"Bot started. Admin group: {ADMIN_GROUP_ID or 'NOT SET'}")
-    app.run_polling(allowed_updates=Update.ALL_TYPES)
+    # Callback query handler (inline buttons)
+    app.add_handler(
+        CallbackQueryHandler(contact_support_callback, pattern="^contact_support$")
+    )
+
+    # Admin reply handler — must be added BEFORE the general message handler
+    # Filters for messages in the admin group that are replies
+    app.add_handler(
+        MessageHandler(
+            filters.Chat(ADMIN_GROUP_ID) & filters.REPLY,
+            handle_admin_reply,
+        )
+    )
+
+    # User message handler — private chats only
+    app.add_handler(
+        MessageHandler(
+            filters.ChatType.PRIVATE
+            & ~filters.COMMAND
+            & (
+                filters.TEXT
+                | filters.PHOTO
+                | filters.VIDEO
+                | filters.Document.ALL
+                | filters.VOICE
+                | filters.Sticker.ALL
+            ),
+            handle_user_message,
+        )
+    )
+
+    logger.info("🚛 HAT Support Bot is starting (polling mode)...")
+    app.run_polling(drop_pending_updates=True)
 
 
 if __name__ == "__main__":
     main()
+
